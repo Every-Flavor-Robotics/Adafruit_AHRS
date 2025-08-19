@@ -149,7 +149,7 @@ class Adafruit_Madgwick : public Adafruit_AHRS_FusionInterface
 
   // --------------------------------
   // Quaternion access (back compatible)
-  void getQuaternion(float* w, float* x, float* y, float* z) const
+  void getQuaternion(float* w, float* x, float* y, float* z)
   {
     *w = q0;
     *x = q1;
