@@ -1,288 +1,564 @@
 //=============================================================================================
-// Madgwick.c
+// Adafruit_Madgwick.cpp  (Chapter 7–style implementation aligned with X-IO /
+// FusionAhrs)
 //=============================================================================================
 //
-// Implementation of Madgwick's IMU and AHRS algorithms.
-// See: http://www.x-io.co.uk/open-source-imu-and-ahrs-algorithms/
-//
-// From the x-io website "Open-source resources available on this website are
-// provided under the GNU General Public Licence unless an alternative licence
-// is provided in source."
-//
-// Date			Author          Notes
-// 29/09/2011	SOH Madgwick    Initial release
-// 02/10/2011	SOH Madgwick	Optimised for reduced CPU load
-// 19/02/2012	SOH Madgwick	Magnetometer measurement is normalised
+// Notes:
+//  - Gyroscope inputs are in deg/s; internally converted to rad/s * 0.5.
+//  - Accel is in g (unitless), magnetometer in arbitrary units (normalised
+//  inside).
+//  - Implements: initial gain ramp, accel/mag rejection with recovery triggers,
+//    angular-rate recovery on gyro overflow, and helper outputs.
 //
 //=============================================================================================
 
-//-------------------------------------------------------------------------------------------
-// Header files
-
-#include "Adafruit_AHRS_Madgwick.h"
+#include <float.h>
 #include <math.h>
 
-//-------------------------------------------------------------------------------------------
-// Definitions
+#include "Adafruit_Madgwick.h"
 
-#define sampleFreqDef 512.0f // sample frequency in Hz
-#define betaDef 0.1f         // 2 * proportional gain
+//------------------------------------------------------------------------------
+// Chapter 7 constants (match FusionAhrs)
+#ifndef INITIAL_GAIN
+#define INITIAL_GAIN (10.0f)
+#endif
 
-//============================================================================================
-// Functions
+#ifndef INITIALISATION_PERIOD
+#define INITIALISATION_PERIOD (3.0f)
+#endif
 
-//-------------------------------------------------------------------------------------------
-// AHRS algorithm update
+//------------------------------------------------------------------------------
+// Local helpers (static)
 
-Adafruit_Madgwick::Adafruit_Madgwick() : Adafruit_Madgwick(betaDef) {}
+static inline int ClampInt(const int value, const int minv, const int maxv)
+{
+  if (value < minv) return minv;
+  if (value > maxv) return maxv;
+  return value;
+}
 
-Adafruit_Madgwick::Adafruit_Madgwick(float gain) {
-  beta = gain;
+static inline float Deg2Rad(const float d)
+{
+  return d * 0.017453292519943295f;
+}  // pi/180
+
+//------------------------------------------------------------------------------
+// Quaternion helpers (member-static in header, defined here)
+
+AM_Quaternion Adafruit_Madgwick::qmul(const AM_Quaternion& A,
+                                      const AM_Quaternion& B)
+{
+  AM_Quaternion C;
+  C.w = A.w * B.w - A.x * B.x - A.y * B.y - A.z * B.z;
+  C.x = A.w * B.x + A.x * B.w + A.y * B.z - A.z * B.y;
+  C.y = A.w * B.y - A.x * B.z + A.y * B.w + A.z * B.x;
+  C.z = A.w * B.z + A.x * B.y - A.y * B.x + A.z * B.w;
+  return C;
+}
+
+AM_Quaternion Adafruit_Madgwick::qadd(const AM_Quaternion& A,
+                                      const AM_Quaternion& B)
+{
+  return AM_Quaternion{A.w + B.w, A.x + B.x, A.y + B.y, A.z + B.z};
+}
+
+AM_Quaternion Adafruit_Madgwick::qnorm(const AM_Quaternion& q)
+{
+  const float n = sqrtf(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+  if (n <= 0.0f) return AM_Quaternion{1, 0, 0, 0};
+  const float inv = 1.0f / n;
+  return AM_Quaternion{q.w * inv, q.x * inv, q.y * inv, q.z * inv};
+}
+
+// q * (0, v)
+AM_Quaternion Adafruit_Madgwick::qmulVec(const AM_Quaternion& q,
+                                         const AM_Vector3& vHalfRad)
+{
+  AM_Quaternion V{0.0f, vHalfRad.x, vHalfRad.y, vHalfRad.z};
+  return qmul(q, V);
+}
+
+//------------------------------------------------------------------------------
+// Private utilities
+
+void Adafruit_Madgwick::resetChapter7State(bool keepSettings)
+{
+  // Quaternion identity
   q0 = 1.0f;
   q1 = 0.0f;
   q2 = 0.0f;
   q3 = 0.0f;
-  invSampleFreq = 1.0f / sampleFreqDef;
+
+  // Cached angles/grav
+  anglesComputed = false;
+  roll = pitch = yaw = 0.0f;
+  grav[0] = 0.0f;
+  grav[1] = 0.0f;
+  grav[2] = 1.0f;
+
+  // Settings & ramp
+  if (!keepSettings)
+  {
+    settings = AM_Settings{};  // defaults
+    settings.gain = 0.5f;
+    settings.accelerationRejection = 90.0f;
+    settings.magneticRejection = 90.0f;
+    settings.gyroscopeRange = 0.0f;
+    settings.recoveryTriggerPeriod = 0;
+  }
+
+  initialising = true;
+  rampedGain = INITIAL_GAIN;
+  rampedGainStep = (INITIAL_GAIN - settings.gain) / INITIALISATION_PERIOD;
+  angularRateRecovery = false;
+
+  // Accel/mag bookkeeping
+  lastAccel = {0.0f, 0.0f, 0.0f};
+  halfAccelFeedback = {0.0f, 0.0f, 0.0f};
+  halfMagFeedback = {0.0f, 0.0f, 0.0f};
+
+  accelerometerIgnored = false;
+  accelerationRecoveryTrigger = 0;
+  accelerationRecoveryTimeout = settings.recoveryTriggerPeriod;
+
+  magnetometerIgnored = false;
+  magneticRecoveryTrigger = 0;
+  magneticRecoveryTimeout = settings.recoveryTriggerPeriod;
+
+  // If gain==0 or recoveryTriggerPeriod==0, disable rejection features
+  if ((settings.gain == 0.0f) || (settings.recoveryTriggerPeriod == 0))
+  {
+    // We mirror Fusion’s approach by pushing thresholds to FLT_MAX
+    // (done in setSettings as well).
+  }
+}
+
+void Adafruit_Madgwick::stepInitialisationRamp(float dt)
+{
+  if (!initialising) return;
+  rampedGain -= rampedGainStep * dt;
+  if ((rampedGain < settings.gain) || (settings.gain == 0.0f))
+  {
+    rampedGain = settings.gain;
+    initialising = false;
+    angularRateRecovery = false;
+  }
+}
+
+// Half of gravity direction per convention (third column of R^T, scaled by 0.5)
+AM_Vector3 Adafruit_Madgwick::halfGravity() const
+{
+  const float& w = q0;
+  const float& x = q1;
+  const float& y = q2;
+  const float& z = q3;
+  switch (settings.convention)
+  {
+    case AM_Convention_NWU:
+    case AM_Convention_ENU:
+      return AM_Vector3{
+          x * z - w * y,
+          y * z + w * x,
+          w * w - 0.5f + z * z,
+      };
+    case AM_Convention_NED:
+      return AM_Vector3{
+          w * y - x * z,
+          -(y * z + w * x),
+          0.5f - w * w - z * z,
+      };
+  }
+  return AM_Vector3{0, 0, 0};
+}
+
+// Half of magnetic-field direction per convention
+AM_Vector3 Adafruit_Madgwick::halfMagnetic() const
+{
+  const float& w = q0;
+  const float& x = q1;
+  const float& y = q2;
+  const float& z = q3;
+  switch (settings.convention)
+  {
+    case AM_Convention_NWU:
+      return AM_Vector3{
+          x * y + w * z,
+          w * w - 0.5f + y * y,
+          y * z - w * x,
+      };
+    case AM_Convention_ENU:
+      return AM_Vector3{
+          0.5f - w * w - x * x,
+          w * z - x * y,
+          -(x * z + w * y),
+      };
+    case AM_Convention_NED:
+      return AM_Vector3{
+          -(x * y + w * z),
+          0.5f - w * w - y * y,
+          w * x - y * z,
+      };
+  }
+  return AM_Vector3{0, 0, 0};
+}
+
+// Cross-product feedback; if dot < 0 use normalised cross (Fusion flip > 90°)
+AM_Vector3 Adafruit_Madgwick::feedback(const AM_Vector3& sensor,
+                                       const AM_Vector3& reference,
+                                       bool flipWhenObtuse)
+{
+  const float dot = vdot(sensor, reference);
+  AM_Vector3 c = vcross(sensor, reference);
+  if (flipWhenObtuse && (dot < 0.0f))
+  {
+    const float m = vmag(c);
+    if (m > 0.0f) return vscale(c, 1.0f / m);
+  }
+  return c;
+}
+
+//------------------------------------------------------------------------------
+// Public: settings
+
+void Adafruit_Madgwick::setSettings(const AM_Settings& s)
+{
+  settings.convention = s.convention;
+  settings.gain = s.gain;
+
+  // Gyro range: if 0 -> disabled, else use 0.98 * range (Fusion behaviour)
+  settings.gyroscopeRange =
+      (s.gyroscopeRange == 0.0f) ? FLT_MAX : (0.98f * s.gyroscopeRange);
+
+  // Rejection thresholds: degrees -> internal metric pow(0.5 * sin(theta), 2)
+  auto rejConv = [](float deg) -> float
+  {
+    if (deg == 0.0f) return FLT_MAX;
+    const float rad = Deg2Rad(deg);
+    const float val = 0.5f * sinf(rad);
+    return val * val;
+  };
+  settings.accelerationRejection = rejConv(s.accelerationRejection);
+  settings.magneticRejection = rejConv(s.magneticRejection);
+
+  settings.recoveryTriggerPeriod = s.recoveryTriggerPeriod;
+
+  accelerationRecoveryTimeout = settings.recoveryTriggerPeriod;
+  magneticRecoveryTimeout = settings.recoveryTriggerPeriod;
+
+  if ((s.gain == 0.0f) || (s.recoveryTriggerPeriod == 0))
+  {
+    settings.accelerationRejection = FLT_MAX;
+    settings.magneticRejection = FLT_MAX;
+  }
+
+  if (!initialising)
+  {
+    rampedGain = settings.gain;
+  }
+  rampedGainStep = (INITIAL_GAIN - settings.gain) / INITIALISATION_PERIOD;
+}
+
+//------------------------------------------------------------------------------
+// Update (with magnetometer) — mirrors FusionAhrsUpdate
+
+void Adafruit_Madgwick::update(float gx, float gy, float gz, float ax, float ay,
+                               float az, float mx, float my, float mz, float dt)
+{
+  // Store accelerometer
+  lastAccel = {ax, ay, az};
+
+  // Reinitialise if gyroscope range exceeded (deg/s)
+  if ((fabsf(gx) > settings.gyroscopeRange) ||
+      (fabsf(gy) > settings.gyroscopeRange) ||
+      (fabsf(gz) > settings.gyroscopeRange))
+  {
+    // Soft reset while maintaining settings; preserve quaternion like Fusion
+    AM_Quaternion qPrev{q0, q1, q2, q3};
+    resetChapter7State(/*keepSettings=*/true);
+    q0 = qPrev.w;
+    q1 = qPrev.x;
+    q2 = qPrev.y;
+    q3 = qPrev.z;
+    angularRateRecovery = true;
+  }
+
+  // Ramp down gain during initialisation
+  stepInitialisationRamp(dt);
+
+  // Calculate direction of gravity indicated by algorithm (scaled by 0.5)
+  const AM_Vector3 halfG = halfGravity();
+
+  // ---------------------------
+  // Accelerometer feedback
+  AM_Vector3 halfAccelFB{0, 0, 0};
+  accelerometerIgnored = true;
+  const bool accelIsZero = (ax == 0.0f) && (ay == 0.0f) && (az == 0.0f);
+  if (!accelIsZero)
+  {
+    // Normalise accelerometer; form feedback vs halfGravity
+    const AM_Vector3 aN = vnorm(AM_Vector3{ax, ay, az});
+    halfAccelFeedback = feedback(aN, halfG, /*flipWhenObtuse=*/true);
+
+    // Gate accelerometer if error above threshold (compare squared magnitudes)
+    if (initialising ||
+        (vmag2(halfAccelFeedback) <= settings.accelerationRejection))
+    {
+      accelerometerIgnored = false;
+      accelerationRecoveryTrigger -= 9;
+    }
+    else
+    {
+      accelerationRecoveryTrigger += 1;
+    }
+
+    // Recovery window logic
+    if (accelerationRecoveryTrigger > accelerationRecoveryTimeout)
+    {
+      accelerationRecoveryTimeout = 0;
+      accelerometerIgnored = false;
+    }
+    else
+    {
+      accelerationRecoveryTimeout = settings.recoveryTriggerPeriod;
+    }
+    accelerationRecoveryTrigger = ClampInt(accelerationRecoveryTrigger, 0,
+                                           settings.recoveryTriggerPeriod);
+
+    // Apply accelerometer feedback if not ignored
+    if (!accelerometerIgnored)
+    {
+      halfAccelFB = halfAccelFeedback;
+    }
+  }
+
+  // ---------------------------
+  // Magnetometer feedback
+  AM_Vector3 halfMagFB{0, 0, 0};
+  magnetometerIgnored = true;
+  const bool magIsZero = (mx == 0.0f) && (my == 0.0f) && (mz == 0.0f);
+  if (!magIsZero)
+  {
+    // Direction of magnetic field indicated by algorithm (scaled by 0.5)
+    const AM_Vector3 halfM = halfMagnetic();
+
+    // Cross(halfGravity, magnetometer), normalised, then feedback vs halfM
+    const AM_Vector3 hxc = vcross(halfG, AM_Vector3{mx, my, mz});
+    const AM_Vector3 hxcN = vnorm(hxc);
+    halfMagFeedback = feedback(hxcN, halfM, /*flipWhenObtuse=*/true);
+
+    // Gate magnetometer based on threshold
+    if (initialising || (vmag2(halfMagFeedback) <= settings.magneticRejection))
+    {
+      magnetometerIgnored = false;
+      magneticRecoveryTrigger -= 9;
+    }
+    else
+    {
+      magneticRecoveryTrigger += 1;
+    }
+
+    // Recovery window logic
+    if (magneticRecoveryTrigger > magneticRecoveryTimeout)
+    {
+      magneticRecoveryTimeout = 0;
+      magnetometerIgnored = false;
+    }
+    else
+    {
+      magneticRecoveryTimeout = settings.recoveryTriggerPeriod;
+    }
+    magneticRecoveryTrigger =
+        ClampInt(magneticRecoveryTrigger, 0, settings.recoveryTriggerPeriod);
+
+    // Apply magnetometer feedback if not ignored
+    if (!magnetometerIgnored)
+    {
+      halfMagFB = halfMagFeedback;
+    }
+  }
+
+  // ---------------------------
+  // Convert gyroscope to radians/s scaled by 0.5
+  const AM_Vector3 halfGyro = vscale(AM_Vector3{gx, gy, gz}, Deg2Rad(0.5f));
+
+  // Apply feedback to gyroscope
+  const AM_Vector3 fbSum = vadd(halfAccelFB, halfMagFB);
+  const AM_Vector3 adjustedHalfGyro = vadd(halfGyro, vscale(fbSum, rampedGain));
+
+  // Integrate quaternion rate: q += q ⊗ (0, adjustedHalfGyro) * dt
+  AM_Quaternion q{q0, q1, q2, q3};
+  q = qadd(q, qmulVec(q, vscale(adjustedHalfGyro, dt)));
+
+  // Normalise quaternion
+  q = qnorm(q);
+  q0 = q.w;
+  q1 = q.x;
+  q2 = q.y;
+  q3 = q.z;
   anglesComputed = false;
 }
 
-void Adafruit_Madgwick::update(float gx, float gy, float gz, float ax, float ay,
-                               float az, float mx, float my, float mz,
-                               float dt) {
-  float recipNorm;
-  float s0, s1, s2, s3;
-  float qDot1, qDot2, qDot3, qDot4;
-  float hx, hy;
-  float _2q0mx, _2q0my, _2q0mz, _2q1mx, _2bx, _2bz, _4bx, _4bz, _2q0, _2q1,
-      _2q2, _2q3, _2q0q2, _2q2q3, q0q0, q0q1, q0q2, q0q3, q1q1, q1q2, q1q3,
-      q2q2, q2q3, q3q3;
-
-  // Use IMU algorithm if magnetometer measurement invalid (avoids NaN in
-  // magnetometer normalisation)
-  if ((mx == 0.0f) && (my == 0.0f) && (mz == 0.0f)) {
-    updateIMU(gx, gy, gz, ax, ay, az, dt);
-    return;
-  }
-
-  // Convert gyroscope degrees/sec to radians/sec
-  gx *= 0.0174533f;
-  gy *= 0.0174533f;
-  gz *= 0.0174533f;
-
-  // Rate of change of quaternion from gyroscope
-  qDot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
-  qDot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
-  qDot3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
-  qDot4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
-
-  // Compute feedback only if accelerometer measurement valid (avoids NaN in
-  // accelerometer normalisation)
-  if (!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
-
-    // Normalise accelerometer measurement
-    recipNorm = invSqrt(ax * ax + ay * ay + az * az);
-    ax *= recipNorm;
-    ay *= recipNorm;
-    az *= recipNorm;
-
-    // Normalise magnetometer measurement
-    recipNorm = invSqrt(mx * mx + my * my + mz * mz);
-    mx *= recipNorm;
-    my *= recipNorm;
-    mz *= recipNorm;
-
-    // Auxiliary variables to avoid repeated arithmetic
-    _2q0mx = 2.0f * q0 * mx;
-    _2q0my = 2.0f * q0 * my;
-    _2q0mz = 2.0f * q0 * mz;
-    _2q1mx = 2.0f * q1 * mx;
-    _2q0 = 2.0f * q0;
-    _2q1 = 2.0f * q1;
-    _2q2 = 2.0f * q2;
-    _2q3 = 2.0f * q3;
-    _2q0q2 = 2.0f * q0 * q2;
-    _2q2q3 = 2.0f * q2 * q3;
-    q0q0 = q0 * q0;
-    q0q1 = q0 * q1;
-    q0q2 = q0 * q2;
-    q0q3 = q0 * q3;
-    q1q1 = q1 * q1;
-    q1q2 = q1 * q2;
-    q1q3 = q1 * q3;
-    q2q2 = q2 * q2;
-    q2q3 = q2 * q3;
-    q3q3 = q3 * q3;
-
-    // Reference direction of Earth's magnetic field
-    hx = mx * q0q0 - _2q0my * q3 + _2q0mz * q2 + mx * q1q1 + _2q1 * my * q2 +
-         _2q1 * mz * q3 - mx * q2q2 - mx * q3q3;
-    hy = _2q0mx * q3 + my * q0q0 - _2q0mz * q1 + _2q1mx * q2 - my * q1q1 +
-         my * q2q2 + _2q2 * mz * q3 - my * q3q3;
-    _2bx = sqrtf(hx * hx + hy * hy);
-    _2bz = -_2q0mx * q2 + _2q0my * q1 + mz * q0q0 + _2q1mx * q3 - mz * q1q1 +
-           _2q2 * my * q3 - mz * q2q2 + mz * q3q3;
-    _4bx = 2.0f * _2bx;
-    _4bz = 2.0f * _2bz;
-
-    // Gradient decent algorithm corrective step
-    s0 = -_2q2 * (2.0f * q1q3 - _2q0q2 - ax) +
-         _2q1 * (2.0f * q0q1 + _2q2q3 - ay) -
-         _2bz * q2 * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) +
-         (-_2bx * q3 + _2bz * q1) *
-             (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) +
-         _2bx * q2 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
-    s1 = _2q3 * (2.0f * q1q3 - _2q0q2 - ax) +
-         _2q0 * (2.0f * q0q1 + _2q2q3 - ay) -
-         4.0f * q1 * (1 - 2.0f * q1q1 - 2.0f * q2q2 - az) +
-         _2bz * q3 * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) +
-         (_2bx * q2 + _2bz * q0) *
-             (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) +
-         (_2bx * q3 - _4bz * q1) *
-             (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
-    s2 = -_2q0 * (2.0f * q1q3 - _2q0q2 - ax) +
-         _2q3 * (2.0f * q0q1 + _2q2q3 - ay) -
-         4.0f * q2 * (1 - 2.0f * q1q1 - 2.0f * q2q2 - az) +
-         (-_4bx * q2 - _2bz * q0) *
-             (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) +
-         (_2bx * q1 + _2bz * q3) *
-             (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) +
-         (_2bx * q0 - _4bz * q2) *
-             (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
-    s3 = _2q1 * (2.0f * q1q3 - _2q0q2 - ax) +
-         _2q2 * (2.0f * q0q1 + _2q2q3 - ay) +
-         (-_4bx * q3 + _2bz * q1) *
-             (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) +
-         (-_2bx * q0 + _2bz * q2) *
-             (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) +
-         _2bx * q1 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
-    recipNorm = invSqrt(s0 * s0 + s1 * s1 + s2 * s2 +
-                        s3 * s3); // normalise step magnitude
-    s0 *= recipNorm;
-    s1 *= recipNorm;
-    s2 *= recipNorm;
-    s3 *= recipNorm;
-
-    // Apply feedback step
-    qDot1 -= beta * s0;
-    qDot2 -= beta * s1;
-    qDot3 -= beta * s2;
-    qDot4 -= beta * s3;
-  }
-
-  // Integrate rate of change of quaternion to yield quaternion
-  q0 += qDot1 * dt;
-  q1 += qDot2 * dt;
-  q2 += qDot3 * dt;
-  q3 += qDot4 * dt;
-
-  // Normalise quaternion
-  recipNorm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
-  q0 *= recipNorm;
-  q1 *= recipNorm;
-  q2 *= recipNorm;
-  q3 *= recipNorm;
-  anglesComputed = 0;
-}
-
-//-------------------------------------------------------------------------------------------
-// IMU algorithm update
+//------------------------------------------------------------------------------
+// Update (IMU only) — simply calls update with zero magnetometer and zero
+// heading during init
 
 void Adafruit_Madgwick::updateIMU(float gx, float gy, float gz, float ax,
-                                  float ay, float az, float dt) {
-  float recipNorm;
-  float s0, s1, s2, s3;
-  float qDot1, qDot2, qDot3, qDot4;
-  float _2q0, _2q1, _2q2, _2q3, _4q0, _4q1, _4q2, _8q1, _8q2, q0q0, q1q1, q2q2,
-      q3q3;
+                                  float ay, float az, float dt)
+{
+  update(gx, gy, gz, ax, ay, az, 0.0f, 0.0f, 0.0f, dt);
 
-  // Convert gyroscope degrees/sec to radians/sec
-  gx *= 0.0174533f;
-  gy *= 0.0174533f;
-  gz *= 0.0174533f;
-
-  // Rate of change of quaternion from gyroscope
-  qDot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
-  qDot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
-  qDot3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
-  qDot4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
-
-  // Compute feedback only if accelerometer measurement valid (avoids NaN in
-  // accelerometer normalisation)
-  if (!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
-
-    // Normalise accelerometer measurement
-    recipNorm = invSqrt(ax * ax + ay * ay + az * az);
-    ax *= recipNorm;
-    ay *= recipNorm;
-    az *= recipNorm;
-
-    // Auxiliary variables to avoid repeated arithmetic
-    _2q0 = 2.0f * q0;
-    _2q1 = 2.0f * q1;
-    _2q2 = 2.0f * q2;
-    _2q3 = 2.0f * q3;
-    _4q0 = 4.0f * q0;
-    _4q1 = 4.0f * q1;
-    _4q2 = 4.0f * q2;
-    _8q1 = 8.0f * q1;
-    _8q2 = 8.0f * q2;
-    q0q0 = q0 * q0;
-    q1q1 = q1 * q1;
-    q2q2 = q2 * q2;
-    q3q3 = q3 * q3;
-
-    // Gradient decent algorithm corrective step
-    s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
-    s1 = _4q1 * q3q3 - _2q3 * ax + 4.0f * q0q0 * q1 - _2q0 * ay - _4q1 +
-         _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
-    s2 = 4.0f * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2 +
-         _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
-    s3 = 4.0f * q1q1 * q3 - _2q1 * ax + 4.0f * q2q2 * q3 - _2q2 * ay;
-    recipNorm = invSqrt(s0 * s0 + s1 * s1 + s2 * s2 +
-                        s3 * s3); // normalise step magnitude
-    s0 *= recipNorm;
-    s1 *= recipNorm;
-    s2 *= recipNorm;
-    s3 *= recipNorm;
-
-    // Apply feedback step
-    qDot1 -= beta * s0;
-    qDot2 -= beta * s1;
-    qDot3 -= beta * s2;
-    qDot4 -= beta * s3;
+  // Zero heading during initialisation (Fusion behaviour)
+  if (initialising)
+  {
+    setHeadingDegrees(0.0f);
   }
-
-  // Integrate rate of change of quaternion to yield quaternion
-  q0 += qDot1 * dt;
-  q1 += qDot2 * dt;
-  q2 += qDot3 * dt;
-  q3 += qDot4 * dt;
-
-  // Normalise quaternion
-  recipNorm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
-  q0 *= recipNorm;
-  q1 *= recipNorm;
-  q2 *= recipNorm;
-  q3 *= recipNorm;
-  anglesComputed = 0;
 }
 
-void Adafruit_Madgwick::update(float gx, float gy, float gz, float ax, float ay,
-                               float az, float mx, float my, float mz) {
-  update(gx, gy, gz, ax, ay, az, mx, my, mz, invSampleFreq);
+//------------------------------------------------------------------------------
+// Heading reset (useful when no magnetometer)
+
+void Adafruit_Madgwick::setHeadingDegrees(float headingDeg)
+{
+  const float w = q0, x = q1, y = q2, z = q3;
+
+  // yaw = atan2(w*z + x*y, 0.5 - y^2 - z^2)  (Fusion’s expression)
+  const float yaw = atan2f(w * z + x * y, 0.5f - y * y - z * z);
+
+  const float halfYawMinusHeading = 0.5f * (yaw - Deg2Rad(headingDeg));
+  const AM_Quaternion rot{cosf(halfYawMinusHeading), 0.0f, 0.0f,
+                          -sinf(halfYawMinusHeading)};
+
+  AM_Quaternion q{q0, q1, q2, q3};
+  q = qmul(rot, q);
+  q = qnorm(q);
+  q0 = q.w;
+  q1 = q.x;
+  q2 = q.y;
+  q3 = q.z;
+  anglesComputed = false;
 }
-void Adafruit_Madgwick::updateIMU(float gx, float gy, float gz, float ax,
-                                  float ay, float az) {
-  updateIMU(gx, gy, gz, ax, ay, az, invSampleFreq);
-};
 
-//-------------------------------------------------------------------------------------------
-// Fast inverse square-root
-// See: http://en.wikipedia.org/wiki/Fast_inverse_square_root
+//------------------------------------------------------------------------------
+// Gravity & acceleration helpers (Chapter 7 outputs)
 
-float Adafruit_Madgwick::invSqrt(float x) {
+AM_Vector3 Adafruit_Madgwick::gravityBodyFromQuat() const
+{
+  // third column of the transposed rotation matrix (not scaled)
+  const float& w = q0;
+  const float& x = q1;
+  const float& y = q2;
+  const float& z = q3;
+  return AM_Vector3{
+      2.0f * (x * z - w * y),
+      2.0f * (y * z + w * x),
+      2.0f * (w * w - 0.5f + z * z),
+  };
+}
+
+AM_Vector3 Adafruit_Madgwick::accelEarthFromBody(const AM_Vector3& aBody) const
+{
+  // R * aBody (explicit expanded form using quaternion)
+  const float& w = q0;
+  const float& x = q1;
+  const float& y = q2;
+  const float& z = q3;
+
+  const float qwqw = w * w;
+  const float qwqx = w * x;
+  const float qwqy = w * y;
+  const float qwqz = w * z;
+  const float qxqy = x * y;
+  const float qxqz = x * z;
+  const float qyqz = y * z;
+
+  AM_Vector3 e;
+  e.x = 2.0f * ((qwqw - 0.5f + x * x) * aBody.x + (qxqy - qwqz) * aBody.y +
+                (qxqz + qwqy) * aBody.z);
+  e.y = 2.0f * ((qxqy + qwqz) * aBody.x + (qwqw - 0.5f + y * y) * aBody.y +
+                (qyqz - qwqx) * aBody.z);
+  e.z = 2.0f * ((qxqz - qwqy) * aBody.x + (qyqz + qwqx) * aBody.y +
+                (qwqw - 0.5f + z * z) * aBody.z);
+
+  // Remove gravity depending on convention
+  switch (settings.convention)
+  {
+    case AM_Convention_NWU:
+    case AM_Convention_ENU:
+      e.z -= 1.0f;
+      break;
+    case AM_Convention_NED:
+      e.z += 1.0f;
+      break;
+  }
+  return e;
+}
+
+AM_Vector3 Adafruit_Madgwick::getLinearAccelerationBody() const
+{
+  const AM_Vector3 g = gravityBodyFromQuat();
+  switch (settings.convention)
+  {
+    case AM_Convention_NWU:
+    case AM_Convention_ENU:
+      return vsub(lastAccel, g);
+    case AM_Convention_NED:
+      return vadd(lastAccel, g);
+  }
+  return AM_Vector3{0, 0, 0};
+}
+
+AM_Vector3 Adafruit_Madgwick::getEarthAcceleration() const
+{
+  return accelEarthFromBody(lastAccel);
+}
+
+//------------------------------------------------------------------------------
+// Diagnostics (match Fusion getters)
+
+AM_InternalStates Adafruit_Madgwick::getInternalStates() const
+{
+  // accelerationError = asin(2 * |halfAccelFeedback|) in degrees
+  const float accelErrRad =
+      asinf(fminf(1.0f, fmaxf(-1.0f, 2.0f * vmag(halfAccelFeedback))));
+  const float magErrRad =
+      asinf(fminf(1.0f, fmaxf(-1.0f, 2.0f * vmag(halfMagFeedback))));
+
+  AM_InternalStates s;
+  s.accelerationErrorDegrees = accelErrRad * 57.29577951308232f;
+  s.accelerometerIgnored = accelerometerIgnored;
+  s.accelerationRecoveryRatio = (settings.recoveryTriggerPeriod == 0)
+                                    ? 0.0f
+                                    : ((float)accelerationRecoveryTrigger /
+                                       (float)settings.recoveryTriggerPeriod);
+
+  s.magneticErrorDegrees = magErrRad * 57.29577951308232f;
+  s.magnetometerIgnored = magnetometerIgnored;
+  s.magneticRecoveryRatio = (settings.recoveryTriggerPeriod == 0)
+                                ? 0.0f
+                                : ((float)magneticRecoveryTrigger /
+                                   (float)settings.recoveryTriggerPeriod);
+  return s;
+}
+
+AM_Flags Adafruit_Madgwick::getFlags() const
+{
+  AM_Flags f;
+  f.initialising = initialising;
+  f.angularRateRecovery = angularRateRecovery;
+  f.accelerationRecovery =
+      (accelerationRecoveryTrigger > accelerationRecoveryTimeout);
+  f.magneticRecovery = (magneticRecoveryTrigger > magneticRecoveryTimeout);
+  return f;
+}
+
+//------------------------------------------------------------------------------
+// Classic utilities retained from original Adafruit code
+
+float Adafruit_Madgwick::invSqrt(float x)
+{
   float halfx = 0.5f * x;
-  union {
+  union
+  {
     float f;
     long i;
   } conv = {x};
@@ -292,14 +568,16 @@ float Adafruit_Madgwick::invSqrt(float x) {
   return conv.f;
 }
 
-//-------------------------------------------------------------------------------------------
-
-void Adafruit_Madgwick::computeAngles() {
+void Adafruit_Madgwick::computeAngles()
+{
+  // Same Euler extraction as original (roll/pitch/yaw) and gravity
   roll = atan2f(q0 * q1 + q2 * q3, 0.5f - q1 * q1 - q2 * q2);
   pitch = asinf(-2.0f * (q1 * q3 - q0 * q2));
   yaw = atan2f(q1 * q2 + q0 * q3, 0.5f - q2 * q2 - q3 * q3);
+
   grav[0] = 2.0f * (q1 * q3 - q0 * q2);
   grav[1] = 2.0f * (q0 * q1 + q2 * q3);
   grav[2] = 2.0f * (q0 * q0 - 0.5f + q3 * q3);
-  anglesComputed = 1;
+
+  anglesComputed = true;
 }
