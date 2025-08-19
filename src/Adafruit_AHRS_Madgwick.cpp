@@ -12,10 +12,10 @@
 //
 //=============================================================================================
 
+#include "Adafruit_AHRS_Madgwick.h"
+
 #include <float.h>
 #include <math.h>
-
-#include "Adafruit_Madgwick.h"
 
 //------------------------------------------------------------------------------
 // Chapter 7 constants (match FusionAhrs)
